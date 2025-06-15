@@ -1,0 +1,5 @@
+.env
+logs/
+output/generated_scripts/
+__pycache__/
+*.log
