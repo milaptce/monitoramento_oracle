@@ -1,8 +1,10 @@
+
 import os
 import requests
 import base64
 import argparse
 from dotenv import load_dotenv
+import pathspec  # Para interpretar o .gitignore
 
 # Carrega variáveis de ambiente
 load_dotenv()
@@ -31,14 +33,45 @@ python functions/github_updater.py --help
 
 """
 
-import os
-import requests
-import base64
-import argparse
-from dotenv import load_dotenv
+
 
 # Carrega variáveis de ambiente
 load_dotenv()
+
+def create_directory_structure(repo, token, relative_path, branch="main"):
+    """
+    Cria diretórios recursivamente no repositório GitHub.
+
+    Args:
+        repo (str): Nome do repositório no formato `username/repo_name`.
+        token (str): Token de acesso pessoal do GitHub.
+        relative_path (str): Caminho relativo do arquivo ou diretório.
+        branch (str): Branch do repositório GitHub.
+    """
+    github_api_url = f"https://api.github.com/repos/{repo}/contents" 
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    # Divide o caminho em partes
+    parts = relative_path.split("/")
+    current_path = ""
+    for part in parts[:-1]:  # Ignora o último elemento (nome do arquivo)
+        current_path += f"{part}/"
+        response = requests.get(f"{github_api_url}/{current_path}", headers=headers)
+        if response.status_code == 404:
+            print(f"Diretório não encontrado. Criando: {current_path}")
+            payload = {
+                "message": f"Criação automática de diretório: {current_path}",
+                "content": "",  # Diretórios são criados enviando um conteúdo vazio
+                "branch": branch
+            }
+            response = requests.put(f"{github_api_url}/{current_path}", headers=headers, json=payload)
+            if response.status_code not in [200, 201]:
+                print(f"Erro ao criar diretório {current_path}: {response.status_code} - {response.text}")
+                return
+
 
 def update_github(directory, message_prefix, branch="main"):
     """
@@ -67,11 +100,24 @@ def update_github(directory, message_prefix, branch="main"):
         print(f"Erro: Diretório '{directory}' não encontrado.")
         return
 
+    # Lê o .gitignore e cria uma especificação de exclusão
+    gitignore_path = os.path.join(directory, ".gitignore")
+    spec = None
+    if os.path.exists(gitignore_path):
+        with open(gitignore_path, "r", encoding="utf-8") as gitignore_file:
+            spec = pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, gitignore_file)
+
     def list_all_files(directory):
-        """Lista todos os arquivos no diretório e subdiretórios."""
+        """Lista todos os arquivos no diretório e subdiretórios, exceto os ignorados pelo .gitignore."""
         for root, _, files in os.walk(directory):
             for file in files:
-                yield os.path.join(root, file)
+                file_path = os.path.join(root, file)
+                relative_path = os.path.relpath(file_path, directory)
+                # Ignora arquivos que correspondem ao .gitignore
+                if spec and spec.match_file(relative_path):
+                    print(f"Ignorando arquivo (via .gitignore): {relative_path}")
+                    continue
+                yield file_path
 
     # Itera sobre os arquivos
     files_found = False
@@ -80,6 +126,9 @@ def update_github(directory, message_prefix, branch="main"):
         try:
             relative_path = os.path.relpath(file_path, ".")  # Mantém a estrutura relativa
             print(f"Processando arquivo: {relative_path}")
+
+            # Cria diretórios recursivamente, se necessário
+            create_directory_structure(repo, token, relative_path, branch)
 
             with open(file_path, "r", encoding="utf-8") as file:
                 content = file.read()
