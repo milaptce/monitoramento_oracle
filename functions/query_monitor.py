@@ -18,3 +18,4 @@ def identify_fts_queries(connection):
             "schema": row[4]
         }
         for row in results
+    ]
