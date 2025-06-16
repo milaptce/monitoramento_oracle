@@ -1,36 +1,37 @@
 # functions/query_monitor.py
-import cx_Oracle
-import logging
-from sql_metadata import Parser
-import hashlib
 
-logging.basicConfig(level=logging.INFO)
+import logging
+import hashlib
+from functions.utils import extract_tables, extract_where_conditions, get_table_schema
+
 logger = logging.getLogger(__name__)
+
 
 def identify_fts_queries(connection):
     """
-    Identifica queries FTS no v$sql e retorna listas normalizadas
+    Identifica queries FTS na view v$sql.
+    Extrai informações como sql_id, sql_text, executions, elapsed_time, schema, tabelas e where_conditions.
     """
+    cursor = connection.cursor()
     try:
-        cursor = connection.cursor()
         cursor.execute("""
-        SELECT sql_id, sql_text, executions, elapsed_time
-        FROM v$sql
-        WHERE sql_text LIKE '%TABLE ACCESS FULL%' OR sql_text LIKE '%/*+ FULL(%'
-        ORDER BY elapsed_time DESC
+            SELECT sql_id, sql_text, executions, elapsed_time
+            FROM v$sql
+            WHERE sql_text LIKE '%TABLE ACCESS FULL%' OR sql_text LIKE '%/*+ FULL(%'
+            ORDER BY elapsed_time DESC
         """)
         rows = cursor.fetchall()
 
         queries = []
         for row in rows:
             try:
-                parser = Parser(row[1])
-                tables = parser.tables_uniq
-                where_columns = parser.where_columns
+                tables = extract_tables(row[1])
+                where_conditions = extract_where_conditions(row[1])
                 schema = get_table_schema(connection, tables[0]) if tables else None
-            except:
+            except Exception as e:
+                logger.warning(f"[WARNING] Erro ao parsear query SQL: {str(e)}")
                 tables = []
-                where_columns = []
+                where_conditions = []
                 schema = None
 
             queries.append({
@@ -39,7 +40,7 @@ def identify_fts_queries(connection):
                 "executions": row[2],
                 "elapsed_time": row[3],
                 "tables": tables,
-                "where_columns": where_columns,
+                "where_conditions": where_conditions,
                 "schema": schema
             })
 
@@ -49,23 +50,22 @@ def identify_fts_queries(connection):
     except Exception as e:
         logger.error(f"[ERRO] Ao buscar queries FTS: {e}")
         return []
+    finally:
+        cursor.close()
 
 
 def group_similar_queries(queries):
     """
-    Agrupa queries com estruturas similares usando hash da assinatura SQL
+    Agrupa queries similares com base em hash MD5 das tabelas e condições do WHERE.
     """
     groups = {}
 
     for q in queries:
-        # Extrair elementos-chave da query
-        try:
-            parser = Parser(q["sql_text"])
-            normalized = f"{parser.tables_uniq} WHERE {parser.where_columns}"
-        except:
-            normalized = "unknown"
+        # Garantir que sempre tenha valores padrão
+        tables = q.get("tables", [])
+        where_conditions = q.get("where_conditions", [])
 
-        # Gerar hash como assinatura única
+        normalized = f"{tables} WHERE {where_conditions}"
         signature = hashlib.md5(normalized.encode()).hexdigest()
 
         if signature not in groups:
@@ -75,21 +75,21 @@ def group_similar_queries(queries):
                 "normalized_key": normalized,
                 "count": 0,
                 "total_exec_time": 0,
-                "avg_exec_time": 0,
-                "tables": list(set(parser.tables_uniq)) if parser.tables_uniq else [],
+                "avg_exec_time": 0.0,
+                "tables": list(set(tables)) if tables else [],
                 "schemas": set(),
-                "where_columns": where_columns or [],
+                "where_conditions": list(set(where_conditions)) if where_conditions else [],
                 "priority_score": 0
             }
 
-        # Atualizar dados do grupo
         group = groups[signature]
         group["count"] += 1
-        group["total_exec_time"] += q["elapsed_time"]
-        group["avg_exec_time"] = round(group["total_exec_time"] / group["count"], 2)
-        group["schemas"].add(q["schema"])
+        group["total_exec_time"] += q.get("elapsed_time", 0)
+        group["avg_exec_time"] = round(group["total_exec_time"] / group["count"], 2) if group["count"] else 0
+        if q.get("schema"):
+            group["schemas"].add(q["schema"])
 
-    # Converter para lista e calcular pontuação de prioridade
+    # Calcular pontuação de prioridade
     grouped_queries = list(groups.values())
     for g in grouped_queries:
         g["priority_score"] = calculate_priority_score(g)
@@ -100,26 +100,8 @@ def group_similar_queries(queries):
 
 def calculate_priority_score(group):
     """
-    Calcula um score baseado em quantidade de execuções e tempo médio
+    Calcula pontuação de prioridade com base no uso do grupo de queries
     """
     weight_exec = group["count"] * 0.6
     weight_time = group["avg_exec_time"] * 0.4
     return round(weight_exec + weight_time, 2)
-
-
-def get_table_schema(connection, table_name):
-    """
-    Retorna o owner (schema) de uma tabela
-    """
-    cursor = connection.cursor()
-    try:
-        cursor.execute(f"""
-        SELECT owner FROM all_tables 
-        WHERE table_name = '{table_name.upper()}'
-        """)
-        result = cursor.fetchone()
-        return result[0] if result else None
-    except:
-        return None
-    finally:
-        cursor.close()
