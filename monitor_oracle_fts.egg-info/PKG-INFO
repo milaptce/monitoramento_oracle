@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: monitor_oracle_fts
+Version: 0.1
+Summary: Projeto modular para monitorar Full Table Scans (FTS) no Oracle 12C
+Author: Seu Nome
+Author-email: seu@email.com
+Requires-Dist: cx_Oracle>=8.0
+Requires-Dist: python-dotenv>=0.19
+Requires-Dist: GitPython>=3.1
+Requires-Dist: sql-metadata>=2.4
+Dynamic: author
+Dynamic: author-email
+Dynamic: requires-dist
+Dynamic: summary

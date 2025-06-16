@@ -1,0 +1,4 @@
+cx_Oracle>=8.0
+python-dotenv>=0.19
+GitPython>=3.1
+sql-metadata>=2.4

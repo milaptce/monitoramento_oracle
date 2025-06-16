@@ -1,7 +1,7 @@
 # setup.sh
 python -m venv fts
 source fts/bin/activate
-git clone https://github.com/milaptce/monitoramento_oracle.git 
+##git clone https://github.com/milaptce/monitoramento_oracle.git 
 cd monitoramento_oracle
 pip install -r requirements.txt
 echo "copiar .env para o diretorio raiz"
