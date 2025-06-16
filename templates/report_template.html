@@ -1,0 +1,18 @@
+<h1>Relatório de Full Table Scans</h1>
+<h2>{{ timestamp }}</h2>
+
+<h3>Esquemas Classificados</h3>
+<table border="1">
+  <tr><th>Esquema</th><th>Categoria</th><th>Total Queries</th><th>Total Tempo (seg)</th></tr>
+  {% for schema, data in schemas.items() %}
+  <tr><td>{{ schema }}</td><td>{{ data.category }}</td><td>{{ data.total_queries }}</td><td>{{ data.total_time_sec }}</td></tr>
+  {% endfor %}
+</table>
+
+<h3>Queries Agrupadas</h3>
+<table border="1">
+  <tr><th>Query</th><th>Tabelas</th><th>Quantidade</th><th>Média de Tempo (ms)</th></tr>
+  {% for group in queries %}
+  <tr><td>{{ group.sample_sql[:100] }}...</td><td>{{ group.tables }}</td><td>{{ group.count }}</td><td>{{ group.avg_exec_time }}</td></tr>
+  {% endfor %}
+</table>

@@ -16,12 +16,14 @@ logging.basicConfig(
 
 # Funções modulares
 from functions.login_db import connect_to_db
-from functions.query_monitor import identify_fts_queries
+from functions.query_monitor import identify_fts_queries, group_similar_queries
 from functions.table_analysis import classify_tables
 from functions.performance_improvement import evaluate_performance
 from functions.script_generator import generate_scripts
 from functions.github_updater import update_github
 from functions.utils import check_first_run, schedule_next_run
+from functions.performance_improvement import evaluate_performance
+from functions.script_generator import generate_scripts
 
 
 def log_execution_start():
@@ -58,6 +60,13 @@ def main():
             return
 
         logging.info(f"🔍 {len(fts_queries)} queries FTS identificadas.")
+        grouped_queries = group_similar_queries(raw_queries)
+
+        for group in grouped_queries:
+            print(f"Grupo {group['group_key']} - {group['count']} instâncias")
+            print(f"Média de tempo: {group['avg_exec_time']}ms")
+            print(f"Pontuação de prioridade: {group['priority_score']}\n")
+
 
         # Classificar tabelas em T1 e T2
         classified_tables = classify_tables(fts_queries)
@@ -68,14 +77,22 @@ def main():
 
         # Avaliar possíveis melhorias de performance
         performance_suggestions = evaluate_performance(classified_tables)
+   
         logging.info(f"💡 Sugestões geradas para {len(performance_suggestions)} objetos.")
         print(f"💡 Sugestões geradas para {len(performance_suggestions)} objetos.")
+
+        # Avaliar melhorias
+        solutions = evaluate_performance(tables, queries)
+        # Gerar scripts
+        generated_scripts = generate_scripts(solutions)
 
         # Gerar scripts SQL com base nas sugestões
         generated_scripts = generate_scripts(performance_suggestions)
         logging.info(f"📝 {len(generated_scripts)} scripts SQL gerados.")
         print(f"📝 {len(generated_scripts)} scripts SQL gerados.")
 
+
+    
         # Atualizar repositório GitHub
         if os.getenv("GITHUB_TOKEN") and os.getenv("GITHUB_REPO"):
             try:

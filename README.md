@@ -21,6 +21,7 @@ Execução Contínua :
 Executa periodicamente a cada 6 horas, iniciando às 00:00h.
 Controla a primeira execução usando o arquivo execucao.ini.
 Estrutura do Projeto
+
 monitor_oracle_fts/
 ├── .env                     # Arquivo de configuração (credenciais)
 ├── .gitignore               # Ignora arquivos sensíveis
@@ -36,9 +37,13 @@ monitor_oracle_fts/
 │   └── github_updater.py    # Atualização no GitHub
 ├── logs/                    # Logs de execução
 ├── output/                  # Saída dos scripts gerados
+│   └── generated_scripts/   # ← onde os scripts serão salvos
 └── config/                  # Configurações adicionais
-    ├── execucao.ini         # Controle de execução
-    └── schemas.json         # Lista de esquemas monitorados
+|    ├── execucao.ini        # Controle de execução
+|    └── schemas.json        # Lista de esquemas monitorados 
+└── README.md
+
+schemas.json é gerado automaticamente (via functions/schema_collector.py)
 
 Pré-requisitos
 Python 3.x instalado.
