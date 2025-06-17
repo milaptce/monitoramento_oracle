@@ -22,7 +22,7 @@ Executa periodicamente a cada 6 horas, iniciando às 00:00h.
 Controla a primeira execução usando o arquivo execucao.ini.
 Estrutura do Projeto
 monitor_oracle_fts/
-├── .env                     # Arquivo de configuração (credenciais)
+├── .env                     # Arquivo de configuração (credenciais) <br>
 ├── .gitignore               # Ignora arquivos sensíveis
 ├── requirements.txt         # Dependências do projeto
 ├── fts.sh                   # Script para inicialização do projeto
