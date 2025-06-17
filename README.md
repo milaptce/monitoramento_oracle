@@ -23,8 +23,8 @@ Controla a primeira execução usando o arquivo execucao.ini.
 Estrutura do Projeto
 monitor_oracle_fts/
 ├── .env                     # Arquivo de configuração (credenciais) <br>
-├── .gitignore               # Ignora arquivos sensíveis
-├── requirements.txt         # Dependências do projeto
+├── .gitignore               # Ignora arquivos sensíveis <br>
+├── requirements.txt         # Dependências do projeto <br>
 ├── fts.sh                   # Script para inicialização do projeto
 ├── main.py                  # Script principal
 ├── functions/               # Funções modulares
