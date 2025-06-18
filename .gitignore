@@ -12,3 +12,4 @@ config/execucao.ini
 .vscode/
 function/test_connection.py
 *.sqlite3
+cemi/

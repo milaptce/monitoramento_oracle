@@ -1,118 +1,130 @@
-# functions/performance_improvement.py
-import cx_Oracle
-from functions.login_db import connect_to_db
-from functions.utils import check_first_run, schedule_next_run
-from functions.table_analysis import classify_tables
-import logging
 
-# Configuração de logging
-logging.basicConfig(level=logging.INFO)
+## performance_improvement.py
+import logging
+from typing import List, Dict, Any, Optional
+from .db_utils import OracleTableReader
+
 logger = logging.getLogger(__name__)
 
-
-def check_existing_indexes(connection, table_name):
+def evaluate_performance(db_reader: OracleTableReader, 
+                        tables: Dict[str, List[Dict[str, Any]]],
+                        queries: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """
-    Verifica quais índices já existem para uma tabela.
+    Avalia impacto potencial de melhorias usando OracleTableReader.
+    
+    Args:
+        db_reader: Instância de OracleTableReader
+        tables: Dicionário com tabelas classificadas (T1 e T2)
+        queries: Lista opcional de queries para análise
+        
+    Returns:
+        Lista de dicionários com sugestões de melhoria
+    
+    Raises:
+        TypeError: Se os parâmetros forem de tipos inválidos
+        RuntimeError: Se ocorrer um erro durante a avaliação
     """
-    cursor = connection.cursor()
+    # Validação de entrada
+    if not isinstance(db_reader, OracleTableReader):
+        logger.error("❌ db_reader deve ser uma instância de OracleTableReader")
+        raise TypeError("db_reader deve ser uma instância de OracleTableReader")
+        
+    if not isinstance(tables, dict):
+        logger.error("❌ tables deve ser um dicionário")
+        raise TypeError("tables deve ser um dicionário")
+    
     try:
-        cursor.execute(f"""
-        SELECT index_name FROM all_indexes 
-        WHERE table_name = '{table_name}'
-        """)
-        indexes = [row[0] for row in cursor.fetchall()]
-        return indexes
+        if not db_reader.is_connected():
+            logger.error("❌ Conexão com banco de dados não disponível.")
+            return []
     except Exception as e:
-        logger.warning(f"[WARNING] Falha ao listar índices da tabela {table_name}: {e}")
-        return []
-    finally:
-        cursor.close()
+        logger.error(f"❌ Erro ao verificar conexão: {str(e)}")
+        raise RuntimeError(f"Erro ao verificar conexão com o banco: {str(e)}")
+    
+    solutions = []
+    
+    try:
+        # Processar tabelas T1
+        for table_info in tables.get("T1", []):
+            if not isinstance(table_info, dict):
+                logger.warning(f"⚠️ Informações inválidas para tabela T1: {table_info}")
+                continue
+                
+            table_name = table_info.get("table")
+            if not table_name:
+                logger.warning("⚠️ Tabela T1 sem nome, ignorando")
+                continue
+                
+            indexes = db_reader.get_existing_indexes(table_name)
+            
+            solutions.append({
+                "table": table_name,
+                "size_mb": table_info.get("size_mb", 0),
+                "category": "T1",
+                "suggestion": "criar índice" if not indexes else "índice já existe",
+                "existing_indexes": indexes,
+                "priority_score": 8 if not indexes else 2,
+                "impact": "Alta" if not indexes else "Baixa"
+            })
+        
+        # Processar tabelas T2
+        for table_info in tables.get("T2", []):
+            if not isinstance(table_info, dict):
+                logger.warning(f"⚠️ Informações inválidas para tabela T2: {table_info}")
+                continue
+                
+            table_name = table_info.get("table")
+            if not table_name:
+                logger.warning("⚠️ Tabela T2 sem nome, ignorando")
+                continue
+                
+            size_mb = table_info.get("size_mb", 0)
+            indexes = db_reader.get_existing_indexes(table_name)
+            
+            relevant_queries = [
+                q for q in (queries or [])
+                if isinstance(q, dict) and table_name in q.get("tables", [])
+            ]
+            
+            gain = sum(
+                _estimate_gain(q, size_mb)["estimated_gain_percent"]
+                for q in relevant_queries
+            ) / len(relevant_queries) if relevant_queries else 0
+            
+            solutions.append({
+                "table": table_name,
+                "size_mb": size_mb,
+                "category": "T2",
+                "suggestion": "refatorar query ou particionar" if indexes else "considerar índice",
+                "queries_affected": [q.get("sql_id") for q in relevant_queries if q.get("sql_id")],
+                "avg_gain_percent": round(gain, 2),
+                "existing_indexes": indexes,
+                "priority_score": 9 if gain > 20 else (7 if gain > 0 else 5),
+                "impact": "Crítico" if gain > 20 else ("Médio" if gain > 0 else "Baixo")
+            })
+        
+        logger.info(f"💡 {len(solutions)} sugestões de melhoria geradas.")
+        return solutions
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao avaliar performance: {str(e)}")
+        raise RuntimeError(f"Erro ao avaliar performance: {str(e)}")
 
-
-def estimate_gain(query, table_size_mb):
-    """
-    Estima o ganho percentual de performance com base no tamanho da tabela e na query
-    """
-    if table_size_mb < 10:
-        gain = 0.5  # Ganho médio para tabelas pequenas
-    else:
-        gain = 0.3  # Ganho menor, mas significativo para tabelas grandes
-
+def _estimate_gain(query: Dict[str, Any], table_size_mb: float) -> Dict[str, Any]:
+    """Estimativa de ganho de performance para uma query."""
+    if not isinstance(query, dict):
+        raise ValueError("Query deve ser um dicionário")
+        
+    if not isinstance(table_size_mb, (int, float)) or table_size_mb < 0:
+        raise ValueError("table_size_mb deve ser um número positivo")
+    
+    base_time = max(1, query.get("elapsed_time", 100))
+    gain_factor = 0.6 if table_size_mb < 10 else (0.4 if table_size_mb < 50 else 0.2)
+    
     return {
-        "estimated_gain_percent": round(gain * 100, 2),
-        "old_time": query.get("elapsed_time", 100),
-        "new_time": round(query.get("elapsed_time", 100) * (1 - gain), 2),
+        "estimated_gain_percent": round(gain_factor * 100, 2),
+        "old_time": base_time,
+        "new_time": round(base_time * (1 - gain_factor), 2),
         "schema": query.get("schema"),
         "sql_id": query.get("sql_id")
     }
-
-
-def evaluate_performance(tables, queries=None):
-    """
-    Avalia impacto potencial de melhorias por tabela, considerando índices existentes
-    
-    Args:
-        tables (dict): Dicionário com T1 e T2
-        queries (list): Lista de dicionários com informações das queries FTS
-    
-    Returns:
-        list: Sugestões de melhoria com pontuação e ação recomendada
-    """
-    connection = connect_to_db()
-    if not connection:
-        logger.error("❌ Falha na conexão ao Oracle. Cancelando análise de performance.")
-        return []
-
-    solutions = []
-
-    # Processar tabelas T1
-    for table_info in tables.get("T1", []):
-        table_name = table_info["table"]
-        size_mb = table_info["size_mb"]
-
-        existing_indexes = check_existing_indexes(connection, table_name)
-
-        solution = {
-            "table": table_name,
-            "size_mb": size_mb,
-            "suggestion": "criar índice" if not existing_indexes else "índice já existe",
-            "existing_indexes": existing_indexes,
-            "priority_score": 8 if not existing_indexes else 2,
-            "impact": "Alta" if not existing_indexes else "Baixa"
-        }
-        solutions.append(solution)
-
-    # Processar tabelas T2
-    for table_info in tables.get("T2", []):
-        table_name = table_info["table"]
-        size_mb = table_info["size_mb"]
-
-        existing_indexes = check_existing_indexes(connection, table_info["table"])
-
-        gain = 0
-        relevant_queries = []
-
-        if queries:
-            relevant_queries = [q for q in queries if table_name in q.get("tables", [])]
-
-        if relevant_queries:
-            gain = sum(
-                estimate_gain(q, size_mb).get("estimated_gain_percent", 0) for q in relevant_queries
-            ) / len(relevant_queries)
-
-        solution = {
-            "table": table_name,
-            "size_mb": size_mb,
-            "suggestion": "refatorar query ou particionar" if existing_indexes else "considerar índice",
-            "queries_affected": [q["sql_id"] for q in relevant_queries],
-            "avg_gain_percent": round(gain, 2),
-            "existing_indexes": existing_indexes,
-            "priority_score": 9 if gain > 0 else 7,
-            "impact": "Crítico" if gain > 0 else "Médio"
-        }
-
-        solutions.append(solution)
-
-    connection.close()
-    logger.info(f"💡 {len(solutions)} sugestões de melhoria geradas.")
-    return solutions

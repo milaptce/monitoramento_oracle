@@ -1,0 +1,1928 @@
+# Arquivo: query_monitor.py
+
+## query_monitor
+
+import logging
+import hashlib
+from typing import List, Dict, Any
+from functions.db_utils import OracleTableReader
+from functions.utils import SQLParser
+
+logger = logging.getLogger(__name__)
+
+def identify_fts_queries(db_reader: OracleTableReader) -> List[Dict[str, Any]]:
+    """
+    Identifica queries FTS (Full Table Scan) no banco de dados Oracle.
+    
+    Args:
+        db_reader: Instância de OracleTableReader para conexão com o banco
+        
+    Returns:
+        Lista de dicionários contendo informações das queries FTS encontradas
+    """
+    query = """
+        SELECT sql_id, sql_text, executions, elapsed_time
+        FROM v$sql
+        WHERE sql_text LIKE '%TABLE ACCESS FULL%' 
+           OR sql_text LIKE '%/*+ FULL(%'
+        ORDER BY elapsed_time DESC
+    """
+    
+    try:
+        results = db_reader.execute_query(query)
+        if not results:
+            logger.info("Nenhuma query FTS encontrada.")
+            return []
+        
+        queries = []
+        for row in results:
+            sql_id, sql_text, executions, elapsed_time = row
+            
+            try:
+                tables = SQLParser.extract_tables(sql_text)
+                where_conditions = SQLParser.extract_where_conditions(sql_text)
+                schema = db_reader.get_table_schema(tables[0]) if tables else None
+                
+                queries.append({
+                    "sql_id": sql_id,
+                    "sql_text": sql_text,
+                    "executions": executions,
+                    "elapsed_time": elapsed_time,
+                    "tables": tables,
+                    "where_conditions": where_conditions,
+                    "schema": schema
+                })
+                
+            except Exception as e:
+                logger.warning(f"Erro ao processar query {sql_id}: {str(e)}")
+                continue
+        
+        logger.info(f"Identificadas {len(queries)} queries FTS")
+        return queries
+        
+    except Exception as e:
+        logger.error(f"Falha ao buscar queries FTS: {str(e)}", exc_info=True)
+        return []
+
+def group_similar_queries(queries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Agrupa queries similares com base em tabelas e condições WHERE.
+    
+    Args:
+        queries: Lista de queries FTS a serem agrupadas
+        
+    Returns:
+        Lista de grupos de queries com estatísticas consolidadas
+    """
+    groups = {}
+    
+    for query in queries:
+        # Criar assinatura única para o grupo
+        signature = _create_query_signature(
+            query.get("tables", []),
+            query.get("where_conditions", [])
+        )
+        
+        # Inicializar grupo se não existir
+        if signature not in groups:
+            groups[signature] = _initialize_query_group(query, signature)
+        
+        # Atualizar estatísticas do grupo
+        _update_group_stats(groups[signature], query)
+    
+    # Calcular métricas finais e prioridades
+    grouped_queries = list(groups.values())
+    for group in grouped_queries:
+        group["avg_exec_time"] = group["total_exec_time"] / group["count"]
+        group["priority_score"] = _calculate_priority_score(group)
+    
+    logger.info(f"Criados {len(grouped_queries)} grupos de queries")
+    return sorted(grouped_queries, key=lambda x: x["priority_score"], reverse=True)
+
+def _create_query_signature(tables: List[str], conditions: List[str]) -> str:
+    """Cria assinatura única para agrupamento de queries"""
+    normalized = f"{sorted(tables)} WHERE {sorted(conditions)}"
+    return hashlib.md5(normalized.encode()).hexdigest()
+
+def _initialize_query_group(query: Dict[str, Any], signature: str) -> Dict[str, Any]:
+    """Inicializa um novo grupo de queries"""
+    return {
+        "group_key": signature,
+        "sample_sql": query["sql_text"],
+        "normalized_key": f"{query['tables']} WHERE {query['where_conditions']}",
+        "count": 0,
+        "total_exec_time": 0,
+        "tables": list(set(query.get("tables", []))),
+        "schemas": set(),
+        "where_conditions": list(set(query.get("where_conditions", []))),
+        "priority_score": 0,
+        "sql_ids": []
+    }
+
+def _update_group_stats(group: Dict[str, Any], query: Dict[str, Any]) -> None:
+    """Atualiza estatísticas de um grupo com nova query"""
+    group["count"] += 1
+    group["total_exec_time"] += query.get("elapsed_time", 0)
+    if query.get("schema"):
+        group["schemas"].add(query["schema"])
+    group["sql_ids"].append(query["sql_id"])
+
+def _calculate_priority_score(group: Dict[str, Any]) -> float:
+    """Calcula pontuação de prioridade para o grupo"""
+    exec_weight = group["count"] * 0.6
+    time_weight = (group["total_exec_time"] / 1000) * 0.4  # Converter para ms
+    return round(exec_weight + time_weight, 2)
+# Teste: test_query_monitor.py
+
+# test_query_monitor.py
+import pytest
+from unittest.mock import patch
+from functions.query_monitor import (
+    identify_fts_queries,
+    group_similar_queries,
+    _create_query_signature,
+    _initialize_query_group,
+    _update_group_stats,
+    _calculate_priority_score
+)
+
+class MockOracleTableReader:
+    def __init__(self):
+        self.test_data = [
+            ("sql1", "SELECT * FROM users WHERE id = 1", 10, 1000),
+            ("sql2", "SELECT * FROM products WHERE price > 100", 5, 2000),
+            ("sql3", "SELECT * FROM users WHERE name LIKE 'A%'", 8, 1500)
+        ]
+    
+    def execute_query(self, query, params=None, fetch_all=True):
+        return self.test_data
+    
+    def get_table_schema(self, table_name):
+        return f"schema_{table_name.lower()}"
+
+class MockSQLParser:
+    @staticmethod
+    def extract_tables(sql_text):
+        if "FROM" not in sql_text:  # Para queries sem tabelas explícitas
+            return []
+        if "users" in sql_text:
+            return ["users"]
+        elif "products" in sql_text:
+            return ["products"]
+        elif "DUAL" in sql_text:  # Para queries com FROM DUAL
+            return []
+        return []
+    
+    @staticmethod
+    def extract_where_conditions(sql_text):
+        if "WHERE" not in sql_text:
+            return []
+        if "id = 1" in sql_text:
+            return ["id = 1"]
+        elif "price > 100" in sql_text:
+            return ["price > 100"]
+        elif "name LIKE 'A%'" in sql_text:
+            return ["name LIKE 'A%'"]
+        return []
+
+@pytest.fixture
+def mock_db_reader():
+    return MockOracleTableReader()
+
+# -----------------------------------------------------------
+# TESTES PRINCIPAIS
+# -----------------------------------------------------------
+
+def test_identify_fts_queries(mock_db_reader):
+    """Testa identificação básica de queries FTS"""
+    with patch('functions.query_monitor.SQLParser', new=MockSQLParser):
+        results = identify_fts_queries(mock_db_reader)
+        
+        assert len(results) == 3
+        assert results[0]["sql_id"] == "sql1"
+        assert results[1]["tables"] == ["products"]
+        assert results[2]["where_conditions"] == ["name LIKE 'A%'"]
+        assert results[0]["schema"] == "schema_users"
+
+def test_group_similar_queries():
+    """Testa agrupamento de queries similares"""
+    test_queries = [
+        {
+            "sql_id": "sql1",
+            "sql_text": "SELECT * FROM users WHERE id = 1",
+            "executions": 10,
+            "elapsed_time": 1000,
+            "tables": ["users"],
+            "where_conditions": ["id = 1"],
+            "schema": "schema_users"
+        },
+        {
+            "sql_id": "sql2",
+            "sql_text": "SELECT * FROM users WHERE id = 2",
+            "executions": 5,
+            "elapsed_time": 2000,
+            "tables": ["users"],
+            "where_conditions": ["id = 2"],
+            "schema": "schema_users"
+        }
+    ]
+    
+    groups = group_similar_queries(test_queries)
+    assert len(groups) == 2
+    assert groups[0]["count"] == 1
+    assert groups[0]["tables"] == ["users"]
+
+def test_query_signature():
+    """Testa geração de assinatura única para queries"""
+    sig1 = _create_query_signature(["users"], ["id = 1"])
+    sig2 = _create_query_signature(["users"], ["id = 2"])
+    sig3 = _create_query_signature(["products"], ["price > 100"])
+    
+    assert sig1 != sig2
+    assert sig1 != sig3
+    assert len(sig1) == 32  # MD5 hash length
+
+def test_priority_score_calculation():
+    """Testa cálculo de score de prioridade"""
+    group = {
+        "count": 10,
+        "total_exec_time": 5000  # 5 segundos
+    }
+    score = _calculate_priority_score(group)
+    assert score == 8.0  # (10*0.6 + 5*0.4)
+
+def test_empty_results(mock_db_reader):
+    """Testa comportamento com resultados vazios"""
+    mock_db_reader.test_data = []
+    with patch('functions.query_monitor.SQLParser', new=MockSQLParser):
+        results = identify_fts_queries(mock_db_reader)
+        assert results == []
+
+# -----------------------------------------------------------
+# TESTES ADICIONAIS PARA CASOS ESPECIAIS
+# -----------------------------------------------------------
+
+def test_queries_with_no_tables(mock_db_reader):
+    """Testa queries que não referenciam tabelas"""
+    mock_db_reader.test_data = [
+        ("sql4", "SELECT 1 FROM DUAL", 1, 100),
+        ("sql5", "SELECT SYSDATE", 1, 50)
+    ]
+    
+    with patch('functions.query_monitor.SQLParser', new=MockSQLParser):
+        results = identify_fts_queries(mock_db_reader)
+        assert len(results) == 2
+        assert results[0]["tables"] == []
+        assert results[1]["tables"] == []
+
+def test_malformed_queries(mock_db_reader):
+    """Testa tratamento de SQL inválido"""
+    mock_db_reader.test_data = [
+        ("sql6", "INVALID SQL SYNTAX", 1, 100),
+        ("sql7", "SELECT * FROM", 1, 150)  # SQL incompleto
+    ]
+    
+    with patch('functions.query_monitor.SQLParser', new=MockSQLParser):
+        results = identify_fts_queries(mock_db_reader)
+        assert len(results) == 2
+        assert results[0]["tables"] == []
+        assert results[1]["tables"] == []
+
+def test_queries_with_complex_conditions(mock_db_reader):
+    """Testa queries com múltiplas condições WHERE"""
+    mock_db_reader.test_data = [
+        ("sql8", "SELECT * FROM orders WHERE status='OPEN' AND value>1000", 3, 750)
+    ]
+    
+    with patch('functions.query_monitor.SQLParser') as mock_parser:
+        mock_parser.extract_tables.return_value = ["orders"]
+        mock_parser.extract_where_conditions.return_value = ["status='OPEN'", "value>1000"]
+        
+        results = identify_fts_queries(mock_db_reader)
+        assert len(results[0]["where_conditions"]) == 2
+
+# -----------------------------------------------------------
+# TESTES DE PERFORMANCE (OPCIONAIS)
+# -----------------------------------------------------------
+
+@pytest.mark.benchmark
+def test_performance_with_large_dataset(benchmark, mock_db_reader):
+    """Teste de performance com grande volume de queries"""
+    mock_db_reader.test_data = [
+        (f"sql{i}", f"SELECT * FROM table{i%10} WHERE col={i}", i%10, i*100)
+        for i in range(1000)  # 1000 queries simuladas
+    ]
+    
+    with patch('functions.query_monitor.SQLParser', new=MockSQLParser):
+        result = benchmark(identify_fts_queries, mock_db_reader)
+        assert len(result) == 1000
+
+
+# Arquivo: table_analysis.py
+import logging
+from typing import Dict, List, Any, Optional, TypedDict
+from functions.db_utils import OracleTableReader
+
+logger = logging.getLogger(__name__)
+
+class TableInfo(TypedDict):
+    """Typed dictionary for table information"""
+    table: str
+    size_mb: float
+    schema: Optional[str]
+    indexes: Optional[List[str]]
+
+class ClassificationResult(TypedDict):
+    """Typed dictionary for classification results"""
+    T1: List[TableInfo]
+    T2: List[TableInfo]
+
+def classify_tables(
+    db_reader: OracleTableReader, 
+    queries: List[Dict[str, Any]],
+    size_threshold: float = 10.0
+) -> ClassificationResult:
+    """
+    Classify tables into T1 (< threshold) and T2 (>= threshold) based on size
+    
+    Args:
+        db_reader: OracleTableReader instance
+        queries: List of query dictionaries
+        size_threshold: Size threshold in MB (default: 10.0)
+        
+    Returns:
+        Dictionary with tables classified into T1 and T2
+    """
+    # Input validation
+    if not isinstance(db_reader, OracleTableReader):
+        logger.error("db_reader must be an OracleTableReader instance")
+        raise TypeError("db_reader must be an OracleTableReader instance")
+        
+    if not isinstance(queries, list):
+        logger.error("queries must be a list")
+        raise TypeError("queries must be a list")
+
+    # Initialize result structure
+    result: ClassificationResult = {
+        "T1": [],
+        "T2": []
+    }
+    
+    # Get unique tables from all queries
+    tables = sorted({table.upper() for query in queries 
+                    if isinstance(query, dict)
+                    for table in query.get("tables", [])
+                    if isinstance(table, str) and table.strip()})
+    
+    if not tables:
+        logger.info("No tables found in queries")
+        return result
+    
+    # Process each table
+    for table in sorted(tables):  # Process in consistent order
+        try:
+            size = db_reader.get_table_size(table)
+            if size is None:
+                logger.warning(f"Could not get size for table {table}")
+                continue
+                
+            schema = db_reader.get_table_schema(table)
+            indexes = db_reader.get_existing_indexes(table)
+            
+            table_info: TableInfo = {
+                "table": table,
+                "size_mb": size,
+                "schema": schema,
+                "indexes": indexes if indexes else None
+            }
+            
+            if size < size_threshold:
+                result["T1"].append(table_info)
+                logger.debug(f"Table {table} classified as T1 ({size:.2f} MB)")
+            else:
+                result["T2"].append(table_info)
+                logger.debug(f"Table {table} classified as T2 ({size:.2f} MB)")
+                
+        except Exception as e:
+            logger.error(f"Error processing table {table}: {str(e)}")
+            continue
+    
+    logger.info(
+        f"Classification complete - T1: {len(result['T1'])} tables | "
+        f"T2: {len(result['T2'])} tables | "
+        f"Threshold: {size_threshold} MB"
+    )
+    
+    return result
+
+
+def analyze_table_access_patterns(
+    db_reader: OracleTableReader,
+    queries: List[Dict[str, Any]],
+    classification: ClassificationResult
+) -> Dict[str, Any]:
+    """
+    Analyze table access patterns based on query usage
+    
+    Args:
+        db_reader: OracleTableReader instance
+        queries: List of analyzed queries
+        classification: Classification result
+        
+    Returns:
+        Dictionary with access pattern statistics
+    """
+    access_stats = {
+        "high_usage_tables": [],
+        "join_patterns": {},
+        "filter_conditions": {}
+    }
+    
+    # Get all classified tables in uppercase
+    all_tables = [t["table"].upper() for t in classification["T1"] + classification["T2"]]
+    
+    for query in queries:
+        if not isinstance(query, dict):
+            continue
+            
+        query_tables = query.get("tables", [])
+        if not isinstance(query_tables, list):
+            continue
+            
+        for table in query_tables:
+            table_upper = table.upper()
+            if table_upper in all_tables:
+                if table_upper not in access_stats["join_patterns"]:
+                    access_stats["join_patterns"][table_upper] = 0
+                access_stats["join_patterns"][table_upper] += 1
+    
+    return access_stats
+
+
+def generate_optimization_recommendations(
+    classification: ClassificationResult,
+    access_stats: Dict[str, Any]
+) -> List[str]:
+    """
+    Generate optimization recommendations based on classification and access patterns
+    
+    Args:
+        classification: Classification result
+        access_stats: Access pattern statistics
+        
+    Returns:
+        List of optimization recommendations
+    """
+    recommendations = []
+    
+    # Recommendations for T1 tables
+    for table in classification["T1"]:
+        rec = f"Table {table['table']} (T1 - {table['size_mb']:.2f}MB): "
+        
+        if not table['indexes']:
+            rec += "Consider adding basic indexes"
+        elif len(table['indexes']) < 3:
+            rec += "Review existing indexes for optimization"
+        else:
+            rec += "Has sufficient indexes"
+            
+        recommendations.append(rec)
+    
+    # Recommendations for T2 tables
+    for table in classification["T2"]:
+        rec = f"Table {table['table']} (T2 - {table['size_mb']:.2f}MB): "
+        
+        if table['size_mb'] > 100:
+            rec += "Consider partitioning "
+        else:
+            rec += "Evaluate future partitioning strategies "
+            
+        join_count = access_stats["join_patterns"].get(table['table'].upper(), 0)
+        if join_count > 5:
+            rec += "| Frequently joined - optimize relationship indexes"
+            
+        recommendations.append(rec)
+    
+    return recommendations
+# Teste: test_table_analysis.py
+
+import pytest
+from unittest.mock import MagicMock, patch
+from functions.table_analysis import (
+    classify_tables,
+    analyze_table_access_patterns,
+    generate_optimization_recommendations,
+    TableInfo,
+    ClassificationResult
+)
+from functions.db_utils import OracleTableReader
+
+class TestTableAnalysis:
+    @pytest.fixture
+    def mock_reader(self):
+        """Fixture providing a mocked OracleTableReader"""
+        mock = MagicMock(spec=OracleTableReader)
+        mock._last_error = None
+        return mock
+
+    @pytest.fixture
+    def sample_queries(self):
+        """Fixture with sample queries for testing"""
+        return [
+            {"tables": ["users"], "sql": "SELECT * FROM users"},
+            {"tables": ["orders"], "sql": "SELECT * FROM orders WHERE status = 'shipped'"},
+            {"tables": ["customers", "orders"], "sql": "JOIN query"}
+        ]
+
+    @pytest.fixture
+    def sample_classification(self):
+        """Fixture with sample classification results"""
+        return {
+            "T1": [
+                {"table": "USERS", "size_mb": 5.0, "schema": "APP", "indexes": ["users_pk"]}
+            ],
+            "T2": [
+                {"table": "ORDERS", "size_mb": 15.0, "schema": "APP", "indexes": ["orders_pk"]},
+                {"table": "CUSTOMERS", "size_mb": 25.0, "schema": "APP", "indexes": None}
+            ]
+        }
+
+    def test_classify_tables_basic(self, mock_reader, sample_queries):
+        """Basic table classification test"""
+        # Configure mock responses in explicit order
+        mock_responses = {
+            "USERS": (5.0, "APP", ["users_pk"]),
+            "ORDERS": (15.0, "APP", ["orders_pk"]),
+            "CUSTOMERS": (25.0, "APP", None)
+        }
+        
+        def get_table_size(table):
+            return mock_responses[table.upper()][0]
+            
+        def get_table_schema(table):
+            return mock_responses[table.upper()][1]
+            
+        def get_existing_indexes(table):
+            return mock_responses[table.upper()][2]
+        
+        mock_reader.get_table_size.side_effect = get_table_size
+        mock_reader.get_table_schema.side_effect = get_table_schema
+        mock_reader.get_existing_indexes.side_effect = get_existing_indexes
+        
+        result = classify_tables(mock_reader, sample_queries)
+        
+        # Verify counts
+        assert len(result["T1"]) == 1
+        assert len(result["T2"]) == 2
+        
+        # Verify specific tables
+        t1_tables = [t["table"] for t in result["T1"]]
+        t2_tables = [t["table"] for t in result["T2"]]
+        
+        assert "USERS" in t1_tables
+        assert "ORDERS" in t2_tables
+        assert "CUSTOMERS" in t2_tables
+        
+        # Verify metadata
+        users_info = next(t for t in result["T1"] if t["table"] == "USERS")
+        assert users_info["size_mb"] == 5.0
+        assert users_info["schema"] == "APP"
+        assert users_info["indexes"] == ["users_pk"]
+
+    def test_classify_tables_empty_input(self, mock_reader):
+        """Test with empty query list"""
+        result = classify_tables(mock_reader, [])
+        assert result == {"T1": [], "T2": []}
+
+    def test_classify_tables_invalid_input(self, mock_reader):
+        """Test with invalid inputs"""
+        with pytest.raises(TypeError):
+            classify_tables(None, [])  # Invalid db_reader
+            
+        with pytest.raises(TypeError):
+            classify_tables(mock_reader, "not_a_list")  # Invalid queries
+
+    def test_classify_tables_with_none_size(self, mock_reader):
+        """Test when table size is unavailable"""
+        mock_reader.get_table_size.return_value = None
+        queries = [{"tables": ["unknown_table"]}]
+        
+        result = classify_tables(mock_reader, queries)
+        assert result == {"T1": [], "T2": []}
+
+    def test_classify_tables_duplicates(self, mock_reader):
+        """Test with duplicate tables in queries"""
+        mock_reader.get_table_size.return_value = 8.0
+        mock_reader.get_table_schema.return_value = "APP"
+        mock_reader.get_existing_indexes.return_value = ["pk"]
+        
+        queries = [
+            {"tables": ["users"]},
+            {"tables": ["users", "orders"]},
+            {"tables": ["users"]}
+        ]
+        
+        result = classify_tables(mock_reader, queries)
+        assert len(result["T1"]) == 2  # users and orders (only one entry for users)
+
+    def test_classify_tables_custom_threshold(self, mock_reader, sample_queries):
+        """Test with custom size threshold"""
+        mock_reader.get_table_size.side_effect = [15.0, 25.0, 5.0]
+        mock_reader.get_table_schema.return_value = "APP"
+        
+        # 20MB threshold
+        result = classify_tables(mock_reader, sample_queries, size_threshold=20.0)
+        
+        assert len(result["T1"]) == 2  # orders (15) and users (5)
+        assert len(result["T2"]) == 1  # customers (25)
+
+    def test_classify_tables_mixed_query_formats(self, mock_reader):
+        """Test with varied query formats"""
+        mock_reader.get_table_size.side_effect = [5.0, 15.0, 8.0, None]
+        mock_reader.get_table_schema.return_value = "APP"
+        mock_reader.get_existing_indexes.return_value = ["pk"]
+        
+        queries = [
+            {"tables": ["valid1"]},
+            {"tables": "not_a_list"},  # invalid
+            {"tables": ["valid2"]},
+            {},  # no tables field
+            {"tables": ["valid3"]},
+            {"tables": [None, ""]}  # invalid
+        ]
+        
+        result = classify_tables(mock_reader, queries)
+        assert len(result["T1"]) == 2  # valid1 (5), valid3 (8)
+        assert len(result["T2"]) == 1  # valid2 (15)
+
+    def test_analyze_table_access_patterns(self, sample_classification, sample_queries):
+        """Test table access pattern analysis"""
+        mock_reader = MagicMock()
+        result = analyze_table_access_patterns(mock_reader, sample_queries, sample_classification)
+        
+        assert "high_usage_tables" in result
+        assert "join_patterns" in result
+        assert isinstance(result["join_patterns"], dict)
+        
+        # Verify join counts
+        assert result["join_patterns"].get("USERS") == 1
+        assert result["join_patterns"].get("ORDERS") == 2  # appears in 2 queries
+        assert result["join_patterns"].get("CUSTOMERS") == 1
+
+    def test_generate_optimization_recommendations(self, sample_classification):
+        """Test optimization recommendation generation"""
+        access_stats = {
+            "join_patterns": {
+                "USERS": 5,
+                "ORDERS": 10,
+                "CUSTOMERS": 3
+            }
+        }
+        
+        recommendations = generate_optimization_recommendations(
+            sample_classification,
+            access_stats
+        )
+        
+        assert len(recommendations) == 3  # 1 T1 + 2 T2
+        assert any("T1" in rec for rec in recommendations)
+        assert any("T2" in rec for rec in recommendations)
+        
+        # Verify recommendations contain expected info
+        assert any("USERS" in rec for rec in recommendations)
+        assert any("ORDERS" in rec for rec in recommendations)
+        assert any("CUSTOMERS" in rec for rec in recommendations)
+        assert any("partitioning" in rec.lower() for rec in recommendations)
+
+    @patch('functions.table_analysis.logger')
+    def test_classify_tables_logging(self, mock_logger, mock_reader, sample_queries):
+        """Test logging messages"""
+        mock_reader.get_table_size.side_effect = [5.0, 15.0, 25.0]
+        mock_reader.get_table_schema.return_value = "APP"
+        
+        classify_tables(mock_reader, sample_queries)
+        
+        # Verify final log message
+        mock_logger.info.assert_called_with(
+            "Classification complete - T1: 1 tables | T2: 2 tables | Threshold: 10.0 MB"
+        )
+
+    def test_classify_tables_error_handling(self, mock_reader, sample_queries):
+        """Test error handling during classification"""
+        mock_reader.get_table_size.side_effect = [
+            5.0,
+            Exception("Simulated error"),
+            25.0
+        ]
+        mock_reader.get_table_schema.return_value = "APP"
+        
+        result = classify_tables(mock_reader, sample_queries)
+        
+        # Verify it processed tables without error and logged the error
+        assert len(result["T1"]) == 1  # users (5.0)
+        assert len(result["T2"]) == 1  # customers (25.0)
+
+
+# Arquivo: utils.py
+# utils.py
+import os
+import logging
+import configparser
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+from pathlib import Path
+from sql_metadata import Parser
+
+# Configuração básica de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class SQLParser:
+    """Responsável por analisar e extrair informações de queries SQL"""
+    
+    @staticmethod
+    def extract_tables(sql_text: str) -> List[str]:
+        """
+        Extrai nomes de tabelas de uma query SQL.
+        
+        Args:
+            sql_text: Texto completo da query SQL
+            
+        Returns:
+            Lista de nomes de tabelas encontradas
+        """
+        try:
+            tables = Parser(sql_text).tables
+            logger.debug(f"Tabelas extraídas: {tables}")
+            return tables
+        except Exception as e:
+            logger.warning(f"Erro ao extrair tabelas: {e}")
+            return []
+
+    @staticmethod
+    def extract_where_conditions(sql_text: str) -> List[str]:
+        """
+        Extrai condições WHERE de uma query SQL de forma robusta.
+        
+        Args:
+            sql_text: Texto completo da query SQL
+            
+        Returns:
+            Lista de condições WHERE encontradas
+        """
+        try:
+            if " WHERE " not in sql_text.upper():
+                return []
+                
+            # Extrai a parte após WHERE mantendo o case original
+            where_part = sql_text.split(" WHERE ")[1].split(";")[0]
+            
+            # Simplificação para casos básicos
+            conditions = []
+            for condition in where_part.split(" AND "):
+                condition = condition.strip()
+                if condition:
+                    # Remove sub-expressões OR para simplificar
+                    main_condition = condition.split(" OR ")[0].strip()
+                    # Remove possíveis parênteses
+                    main_condition = main_condition.replace("(", "").replace(")", "")
+                    if main_condition:
+                        conditions.append(main_condition)
+            
+            logger.debug(f"Condições WHERE extraídas: {conditions}")
+            return conditions
+            
+        except Exception as e:
+            logger.warning(f"Erro ao extrair condições WHERE: {e}")
+            return []
+
+
+class ExecutionController:
+    """Controla o estado e agendamento das execuções do monitor"""
+    
+    def __init__(self, config_path: str = "config/execution.ini"):
+        """
+        Inicializa o controlador de execução.
+        
+        Args:
+            config_path: Caminho para o arquivo de configuração
+        """
+        self.config_path = Path(config_path)
+        self.config = configparser.ConfigParser()
+        self._ensure_config_dir()
+        
+        # Carrega configuração se o arquivo existir
+        if self.config_path.exists():
+            self.config.read(self.config_path)
+
+    def _ensure_config_dir(self) -> None:
+        """Garante que o diretório de configuração existe"""
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def check_first_run(self) -> bool:
+        """
+        Verifica se é a primeira execução do sistema.
+        Retorna True apenas na primeira execução real.
+        """
+        # Se o arquivo não existe, é primeira execução
+        if not self.config_path.exists():
+            self._init_config_file()
+            return True
+            
+        # Se existe mas não tem a seção Execution
+        if not self.config.has_section("Execution"):
+            self._init_config_file()
+            return True
+            
+        # Verifica o flag FIRST_RUN
+        first_run = self.config.get("Execution", "FIRST_RUN", fallback="1") == "1"
+        
+        # Se for primeira execução, atualiza o arquivo
+        if first_run:
+            self._update_config_first_run()
+            
+        return first_run
+
+    def _init_config_file(self) -> None:
+        """Inicializa o arquivo de configuração para primeira execução"""
+        self.config["Execution"] = {
+            "FIRST_RUN": "0",  # Já marca como não é mais primeira execução
+            "LAST_RUN_TIMESTAMP": datetime.now().isoformat(),
+            "NEXT_RUN_TIMESTAMP": ""
+        }
+        self._save_config()
+        logger.info("Arquivo de configuração inicializado")
+
+    def _update_config_first_run(self) -> None:
+        """Atualiza o status após a primeira execução"""
+        self.config.set("Execution", "FIRST_RUN", "0")
+        self.config.set("Execution", "LAST_RUN_TIMESTAMP", datetime.now().isoformat())
+        self._save_config()
+        logger.info("Configuração de primeira execução atualizada")
+
+    def schedule_next_run(self, hours: int = 6) -> str:
+        """
+        Agenda a próxima execução do monitor.
+        
+        Args:
+            hours: Horas até a próxima execução
+            
+        Returns:
+            Timestamp da próxima execução formatada
+        """
+        next_run = datetime.now() + timedelta(hours=hours)
+        next_run_str = next_run.strftime("%Y-%m-%d %H:%M")
+        
+        self.config.read(self.config_path)
+        self.config.set("Execution", "NEXT_RUN_TIMESTAMP", next_run_str)
+        self._save_config()
+        
+        logger.info(f"Próxima execução agendada para {next_run_str}")
+        return next_run_str
+
+    def _save_config(self) -> None:
+        """Salva o arquivo de configuração"""
+        with open(self.config_path, "w") as config_file:
+            self.config.write(config_file)
+
+
+class OracleUtils:
+    """Utilitários específicos para Oracle Database"""
+    
+    @staticmethod
+    def format_sql_query(query: str, params: Dict[str, Any] = None) -> str:
+        """
+        Formata uma query SQL com parâmetros para logging.
+        
+        Args:
+            query: Query SQL
+            params: Dicionário de parâmetros
+            
+        Returns:
+            Query formatada como string
+        """
+        if not params:
+            return query
+            
+        formatted = query
+        for key, value in params.items():
+            formatted = formatted.replace(f":{key}", str(value))
+        return formatted
+
+
+def setup_logging(log_dir: str = "logs", log_file: str = "monitor.log", level: int = logging.INFO) -> None:
+    """
+    Configura o sistema de logging centralizado.
+    
+    Args:
+        log_dir: Diretório para armazenar logs
+        log_file: Nome do arquivo de log
+        level: Nível de logging (default: INFO)
+    """
+    log_path = Path(log_dir) / log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    handlers = [
+        logging.StreamHandler(),
+        logging.FileHandler(log_path)
+    ]
+    
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=handlers
+    )
+    logger.info(f"Logging configurado. Arquivo: {log_path}")
+# Teste: test_utils.py
+
+# test_utils.py
+import pytest
+import configparser
+from pathlib import Path
+from functions.utils import ExecutionController, SQLParser, OracleUtils
+
+class TestSQLParser:
+    def test_extract_tables(self):
+        assert SQLParser.extract_tables("SELECT * FROM users") == ["users"]
+        assert SQLParser.extract_tables("SELECT * FROM users u JOIN orders o ON u.id=o.user_id") == ["users", "orders"]
+    
+    def test_extract_where_conditions(self):
+        # Teste com diferentes formatos de WHERE
+        conditions = SQLParser.extract_where_conditions(
+            "SELECT * FROM users WHERE id=1 AND name='test'"
+        )
+        assert len(conditions) == 2
+        assert "id=1" in conditions[0] or "id=1" in conditions[1]
+        assert "name='test'" in conditions[0] or "name='test'" in conditions[1]
+
+class TestExecutionController:
+    def test_config_file_creation(self, tmp_path):
+        config_file = tmp_path / "new_config.ini"
+        ec = ExecutionController(config_file)
+        
+        # Verifica comportamento de primeira execução
+        assert ec.check_first_run() is True
+        assert config_file.exists()
+        
+        # Verifica conteúdo do arquivo
+        config = configparser.ConfigParser()
+        config.read(config_file)
+        assert config.get("Execution", "FIRST_RUN", fallback="1") == "0"
+    
+    def test_subsequent_runs(self, tmp_path):
+        config_file = tmp_path / "existing_config.ini"
+        
+        # Configuração inicial
+        config = configparser.ConfigParser()
+        config["Execution"] = {"FIRST_RUN": "0", "LAST_RUN": "2023-01-01"}
+        with open(config_file, 'w') as f:
+            config.write(f)
+        
+        # Testa com arquivo existente
+        ec = ExecutionController(config_file)
+        assert ec.check_first_run() is False
+
+class TestOracleUtils:
+    def test_format_sql_query(self):
+        sql = "SELECT * FROM users WHERE id=:id AND date=:date"
+        params = {"id": 1, "date": "2023-01-01"}
+        formatted = OracleUtils.format_sql_query(sql, params)
+        assert "id=1" in formatted
+        assert "date=2023-01-01" in formatted
+        assert "WHERE" in formatted
+
+
+# Arquivo: db_utils.py
+#db_utils.py 
+import cx_Oracle
+import logging
+import os
+from functools import wraps
+from typing import List, Dict, Any, Optional, Union
+from dotenv import load_dotenv
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+def handle_db_errors(func):
+    """
+    Decorator para tratamento padrão de erros de banco de dados.
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except cx_Oracle.DatabaseError as e:
+            error = f"Erro de banco de dados em {func.__name__}: {e}"
+            logger.error(error)
+            if args and hasattr(args[0], '_last_error'):
+                args[0]._last_error = error
+            return None
+        except Exception as e:
+            error = f"Erro inesperado em {func.__name__}: {e}"
+            logger.error(error)
+            if args and hasattr(args[0], '_last_error'):
+                args[0]._last_error = error
+            return None
+    return wrapper
+
+
+class OracleTableReader:
+    """
+    Classe central para operações de banco de dados Oracle.
+    Gerencia conexões, executa queries e fornece utilitários.
+    """
+    
+    def __init__(self, env_file: str = None):
+        """
+        Inicializa o leitor de banco de dados.
+        
+        Args:
+            env_file: Caminho opcional para arquivo .env personalizado
+        """
+        self._connection = None
+        self._last_error = None
+        self._load_config(env_file)
+        
+    def _load_config(self, env_file: str = None) -> None:
+        """Carrega configurações do .env"""
+        env_path = env_file or os.path.join(os.getenv('PROJECT_PATH', '.'), '.env')
+        try:
+            load_dotenv(env_path)
+            self.db_config = {
+                'host': os.getenv('DB_HOST'),
+                'port': os.getenv('DB_PORT'),
+                'service_name': os.getenv('DB_SERVICE_NAME'),
+                'username': os.getenv('DB_USERNAME'),
+                'password': os.getenv('DB_PASSWORD')
+            }
+            logger.debug("Configurações de banco de dados carregadas")
+        except Exception as e:
+            logger.error(f"Erro ao carregar configurações: {e}")
+            raise
+            
+    def __enter__(self):
+        """Suporte para context manager"""
+        self.connect()
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Garante que a conexão será fechada"""
+        self.close()
+        
+    @property
+    def last_error(self) -> Optional[str]:
+        """Retorna o último erro ocorrido"""
+        return self._last_error
+    
+    def connect(self) -> bool:
+        """
+        Estabelece conexão com o banco de dados Oracle.
+        
+        Returns:
+            bool: True se a conexão foi bem sucedida
+        """
+        if self.is_connected():
+            return True
+            
+        try:
+            dsn = cx_Oracle.makedsn(
+                self.db_config['host'],
+                self.db_config['port'],
+                service_name=self.db_config['service_name']
+            )
+            self._connection = cx_Oracle.connect(
+                user=self.db_config['username'],
+                password=self.db_config['password'],
+                dsn=dsn
+            )
+            logger.info("✅ Conexão com Oracle estabelecida com sucesso.")
+            return True
+        except cx_Oracle.DatabaseError as e:
+            self._last_error = str(e)
+            logger.error(f"❌ Falha na conexão com Oracle: {e}")
+            return False
+        except Exception as e:
+            self._last_error = str(e)
+            logger.error(f"❌ Erro inesperado ao conectar: {e}")
+            return False
+    
+    def close(self) -> None:
+        """Fecha a conexão com o banco de dados"""
+        if self._connection:
+            self._connection.close()
+            self._connection = None
+            logger.info("🔌 Conexão com Oracle encerrada.")
+    
+    def is_connected(self) -> bool:
+        """Verifica se há uma conexão ativa"""
+        return self._connection is not None
+    
+    @handle_db_errors
+    def execute_query(self, query: str, params: Optional[dict] = None, 
+                    fetch_all: bool = True) -> Optional[Union[List[tuple], tuple]]:
+        """
+        Executa uma query SQL e retorna os resultados.
+        
+        Args:
+            query: Query SQL a ser executada
+            params: Parâmetros para a query (opcional)
+            fetch_all: Se True retorna todos os resultados, senão apenas um
+            
+        Returns:
+            Resultados da query ou None em caso de erro
+        """
+        if not self.is_connected() and not self.connect():
+            return None
+                
+        with self._connection.cursor() as cursor:
+            cursor.execute(query, params or {})
+            return cursor.fetchall() if fetch_all else cursor.fetchone()
+    
+    @handle_db_errors
+    def get_table_size(self, table_name: str) -> Optional[float]:
+        """
+        Obtém o tamanho de uma tabela em MB.
+        
+        Args:
+            table_name: Nome da tabela
+            
+        Returns:
+            Tamanho em MB ou None se não encontrado
+        """
+        query = """
+            SELECT bytes / 1024 / 1024 AS size_mb
+            FROM dba_segments
+            WHERE segment_name = UPPER(:table_name) AND segment_type = 'TABLE'
+        """
+        result = self.execute_query(query, {'table_name': table_name}, fetch_all=False)
+        # Extração segura do valor - trata tanto resultados vazios quanto estrutura de tupla
+        if not result:
+            return None
+        return result[0] if isinstance(result, (tuple, list)) else result
+    
+    @handle_db_errors
+    def get_table_schema(self, table_name: str) -> Optional[str]:
+        """
+        Obtém o schema (owner) de uma tabela.
+        
+        Args:
+            table_name: Nome da tabela
+            
+        Returns:
+            Nome do schema ou None se não encontrado
+        """
+        query = "SELECT owner FROM all_tables WHERE table_name = UPPER(:table_name)"
+        result = self.execute_query(query, {'table_name': table_name}, fetch_all=False)
+        return result[0] if result else None
+    
+    @handle_db_errors
+    def get_existing_indexes(self, table_name: str) -> List[str]:
+        """
+        Lista os índices existentes para uma tabela.
+        
+        Args:
+            table_name: Nome da tabela
+            
+        Returns:
+            Lista de nomes de índices
+        """
+        query = """
+            SELECT index_name 
+            FROM all_indexes 
+            WHERE table_name = UPPER(:table_name)
+        """
+        results = self.execute_query(query, {'table_name': table_name})
+        return [row[0] for row in results] if results else []
+
+def handle_db_errors(func):
+    """
+    Decorator para tratamento padrão de erros de banco de dados.
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except cx_Oracle.DatabaseError as e:
+            error = f"Erro de banco de dados em {func.__name__}: {e}"
+            logger.error(error)
+            if args and hasattr(args[0], '_last_error'):
+                args[0]._last_error = error
+            return None
+        except Exception as e:
+            error = f"Erro inesperado em {func.__name__}: {e}"
+            logger.error(error)
+            if args and hasattr(args[0], '_last_error'):
+                args[0]._last_error = error
+            return None
+    return wrapper
+# Teste: test_db_utils.py
+
+# test_db_utils.py
+import pytest
+from unittest.mock import MagicMock, patch
+from functions.db_utils import OracleTableReader
+
+class TestOracleTableReader:
+    @patch('cx_Oracle.connect')
+    def test_connection(self, mock_connect):
+        mock_connect.return_value = MagicMock()
+        reader = OracleTableReader()
+        assert reader.connect() is True
+    
+    def test_execute_query(self):
+        reader = OracleTableReader()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [("test",)]
+        
+        reader._connection = MagicMock()
+        reader._connection.cursor.return_value.__enter__.return_value = mock_cursor
+        
+        result = reader.execute_query("SELECT 1 FROM DUAL")
+        assert result == [("test",)]
+    
+    @patch('functions.db_utils.OracleTableReader.execute_query')
+    def test_get_table_size(self, mock_execute):
+        # Configura o mock para retornar o valor diretamente (não uma tupla)
+        mock_execute.return_value = 10.5  # Retorno direto do valor float
+        
+        reader = OracleTableReader()
+        size = reader.get_table_size("users")
+        
+        assert size == 10.5
+        assert isinstance(size, float)
+
+    @patch('functions.db_utils.OracleTableReader.execute_query')
+    def test_get_table_size_with_tuple(self, mock_execute):
+        # Teste alternativo para quando o Oracle retorna uma tupla
+        mock_execute.return_value = (10.5,)  # Formato de tupla
+        
+        reader = OracleTableReader()
+        size = reader.get_table_size("users")
+        
+        assert size == 10.5
+        assert isinstance(size, float)
+
+    @patch('functions.db_utils.OracleTableReader.execute_query')
+    def test_get_table_size_not_found(self, mock_execute):
+        mock_execute.return_value = None  # Simula tabela não encontrada
+        reader = OracleTableReader()
+        size = reader.get_table_size("nonexistent")
+        assert size is None
+
+
+# Arquivo: report_generator.py
+# report_generation.py
+
+from jinja2 import Environment, FileSystemLoader, TemplateNotFound
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional
+
+def generate_html_report(
+    grouped_queries: Dict,
+    classified_schemas: Dict,
+    output_dir: str = "output/reports",
+    template_name: str = "report_template.html",
+    template_dir: Optional[str] = None
+) -> str:
+    """
+    Generate HTML report from query and schema data
+
+    Args:
+        grouped_queries: Dictionary of categorized queries
+        classified_schemas: Dictionary of schema classifications
+        output_dir: Output directory path
+        template_name: Name of the template file
+        template_dir: Optional custom template directory path
+
+    Returns:
+        Path to the generated report
+
+    Raises:
+        ValueError: If input data is invalid
+        RuntimeError: If report generation fails for other reasons
+    """
+    # Validate input data first (before any side effects)
+    if not isinstance(grouped_queries, dict) or not isinstance(classified_schemas, dict):
+        raise ValueError("Input data must be dictionaries")
+
+    try:
+        # Set up template environment
+        if template_dir is None:
+            template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+        
+        env = Environment(loader=FileSystemLoader(template_dir))
+        
+        try:
+            template = env.get_template(template_name)
+        except TemplateNotFound:
+            available = "\n".join(f" - {f}" for f in Path(template_dir).glob("*.html"))
+            raise RuntimeError(
+                f"Template '{template_name}' not found in {template_dir}\n"
+                f"Available templates:\n{available}"
+            )
+
+        # Create output directory if it doesn't exist
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Generate output path with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = os.path.join(output_dir, f"fts_report_{timestamp}.html")
+        
+        # Render and save report
+        output = template.render(
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            queries=grouped_queries,
+            schemas=classified_schemas
+        )
+        
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(output)
+            
+        return report_path
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate report: {str(e)}")
+# Teste: test_report_generator.py
+
+# test_report_generator.py
+import pytest
+from unittest.mock import patch, MagicMock
+from functions.report_generator import generate_html_report
+from datetime import datetime
+import os
+from pathlib import Path
+
+class TestReportGeneration:
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path):
+        """Setup test environment with template"""
+        self.template_dir = tmp_path / "templates"
+        self.template_dir.mkdir()
+        
+        # Create test template
+        template_content = """<html><body>
+            <p>{{ timestamp }}</p>
+            {% for cat, items in queries.items() %}
+            <h2>{{ cat }}</h2>
+            <ul>{% for item in items %}<li>{{ item }}</li>{% endfor %}</ul>
+            {% endfor %}
+            {% for cat, items in schemas.items() %}
+            <h2>{{ cat }}</h2>
+            <ul>{% for item in items %}<li>{{ item }}</li>{% endfor %}</ul>
+            {% endfor %}
+        </body></html>"""
+        
+        (self.template_dir / "test_template.html").write_text(template_content)
+        
+        self.sample_data = {
+            "grouped_queries": {
+                "slow": ["SELECT * FROM large_table"],
+                "fast": ["SELECT id FROM users"]
+            },
+            "classified_schemas": {
+                "T1": ["app_schema"],
+                "T2": ["reporting_schema"]
+            }
+        }
+
+    def test_generate_html_report_success(self, tmp_path):
+        """Test successful report generation"""
+        output_dir = tmp_path / "reports"
+        report_path = generate_html_report(
+            grouped_queries=self.sample_data["grouped_queries"],
+            classified_schemas=self.sample_data["classified_schemas"],
+            output_dir=str(output_dir),
+            template_name="test_template.html",
+            template_dir=str(self.template_dir))
+        
+        assert Path(report_path).exists()
+        content = Path(report_path).read_text()
+        assert "SELECT * FROM large_table" in content
+        assert "app_schema" in content
+
+    def test_generate_html_report_creates_directory(self, tmp_path):
+        """Test that missing directories are created"""
+        output_dir = tmp_path / "new" / "reports"
+        report_path = generate_html_report(
+            grouped_queries=self.sample_data["grouped_queries"],
+            classified_schemas=self.sample_data["classified_schemas"],
+            output_dir=str(output_dir),
+            template_name="test_template.html",
+            template_dir=str(self.template_dir))
+        
+        assert output_dir.exists()
+
+    def test_generate_html_report_missing_template(self, tmp_path):
+        """Test missing template handling"""
+        with pytest.raises(RuntimeError, match="Template 'missing.html' not found"):
+            generate_html_report(
+                grouped_queries=self.sample_data["grouped_queries"],
+                classified_schemas=self.sample_data["classified_schemas"],
+                template_name="missing.html",
+                template_dir=str(self.template_dir))
+
+    def test_generate_html_report_invalid_data(self, tmp_path):
+        """Test with invalid input data"""
+        # Test invalid grouped_queries
+        with pytest.raises(ValueError, match="Input data must be dictionaries"):
+            generate_html_report(
+                grouped_queries="invalid",
+                classified_schemas={},
+                template_dir=str(self.template_dir))
+
+        # Test invalid classified_schemas
+        with pytest.raises(ValueError, match="Input data must be dictionaries"):
+            generate_html_report(
+                grouped_queries={},
+                classified_schemas="invalid",
+                template_dir=str(self.template_dir))
+        
+    @patch('builtins.open')
+    def test_generate_html_report_write_error(self, mock_open, tmp_path):
+        """Test file write failure"""
+        mock_open.side_effect = IOError("Write error")
+        with pytest.raises(RuntimeError, match="Failed to generate report"):
+            generate_html_report(
+                grouped_queries=self.sample_data["grouped_queries"],
+                classified_schemas=self.sample_data["classified_schemas"],
+                template_dir=str(self.template_dir))
+
+
+# Arquivo: script_generator.py
+# script_generator.py
+
+import os
+from datetime import datetime
+import logging
+from typing import List, Dict, Optional
+
+# Configuração de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def generate_index_script(table_name: str, column: str = "ID") -> str:
+    """Gera script para criar índice em uma coluna específica"""
+    if not isinstance(table_name, str) or not table_name.strip():
+        raise ValueError("Nome da tabela inválido")
+    if not isinstance(column, str) or not column.strip():
+        raise ValueError("Nome da coluna inválido")
+        
+    return f"""-- Script gerado em {datetime.now().strftime('%Y-%m-%d %H:%M')}
+CREATE INDEX idx_{table_name.lower()}_{column.lower()} ON {table_name}({column});
+"""
+
+def generate_refactor_script(query: Dict) -> str:
+    """Sugere refatoração básica da query com dica de otimização"""
+    required_fields = ['sql_id', 'sample_sql']
+    if not all(field in query for field in required_fields):
+        raise ValueError(f"Query deve conter os campos: {required_fields}")
+    
+    return f"""-- Refatoração sugerida para: {query['sql_id']}
+-- Tempo médio antes: {query.get('avg_time', 'desconhecido')}ms
+-- Esquema: {query.get('schema', 'desconhecido')}
+{query['sample_sql']};
+-- Sugerimos revisão do plano de execução e possíveis filtros adicionais.
+"""
+
+def save_sql_script(script: str, filename: str) -> bool:
+    """Salva o script no diretório de saída"""
+    if not script or not isinstance(script, str):
+        raise ValueError("Script inválido")
+    if not filename or not isinstance(filename, str):
+        raise ValueError("Nome de arquivo inválido")
+    
+    output_dir = "output/generated_scripts"
+    os.makedirs(output_dir, exist_ok=True)
+    file_path = os.path.join(output_dir, f"{filename}.sql")
+    
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(script)
+        logger.info(f"📝 Script salvo: {file_path}")
+        return True
+    except Exception as e:
+        logger.error(f"[ERRO] Ao salvar script {filename}: {e}")
+        return False
+
+def generate_scripts(solutions: List[Dict]) -> List[str]:
+    """
+    Recebe uma lista de soluções e gera os scripts adequados.
+    
+    Args:
+        solutions: Lista de dicionários com informações de melhoria
+    
+    Returns:
+        Lista de caminhos dos scripts gerados
+    
+    Raises:
+        ValueError: Se solutions não for uma lista
+    """
+    if not isinstance(solutions, list):
+        raise ValueError("solutions deve ser uma lista")
+    
+    generated_files = []
+
+    if not solutions:
+        logger.warning("⚠️ Nenhuma solução encontrada. Nenhum script será gerado.")
+        return []
+
+    for solution in solutions:
+        if not isinstance(solution, dict):
+            logger.warning("⚠️ Solução inválida (não é dicionário), ignorando")
+            continue
+
+        try:
+            table_name = solution.get("table", "unknown_table")
+            category = solution.get("category", "T1")
+            sample_sql = solution.get("sample_sql", "")
+
+            if category == "T1":
+                script = generate_index_script(table_name)
+                filename = f"T1_idx_{table_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            elif category == "T2":
+                script = generate_refactor_script({
+                    "sql_id": solution.get("group_key", "unknown"),
+                    "avg_time": solution.get("avg_exec_time", 0),
+                    "schema": solution.get("schema", "unknown"),
+                    "sample_sql": sample_sql
+                })
+                filename = f"T2_refactor_{table_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            else:
+                logger.warning(f"⚠️ Categoria desconhecida para tabela {table_name}: {category}")
+                continue
+
+            if save_sql_script(script, filename):
+                generated_files.append(filename)
+        except Exception as e:
+            logger.error(f"Erro ao gerar script para {table_name}: {e}")
+
+    logger.info(f"✅ {len(generated_files)} scripts SQL gerados.")
+    return generated_files
+# Teste: test_script_generator.py
+
+# test_script_generator.py
+import pytest
+from unittest.mock import patch, mock_open, MagicMock
+from functions.script_generator import (
+    generate_scripts,
+    generate_index_script,
+    generate_refactor_script,
+    save_sql_script
+)
+from datetime import datetime
+import logging
+
+class TestScriptGenerator:
+    def test_generate_index_script_success(self):
+        """Test successful index script generation"""
+        result = generate_index_script("Users", "ID")
+        assert "CREATE INDEX idx_users_id ON Users(ID)" in result
+        assert datetime.now().strftime("%Y-%m-%d") in result
+
+    def test_generate_index_script_invalid_input(self):
+        """Test index script with invalid input"""
+        with pytest.raises(ValueError):
+            generate_index_script("", "id")
+        with pytest.raises(ValueError):
+            generate_index_script("users", "")
+
+    def test_generate_refactor_script_success(self):
+        """Test successful refactor script generation"""
+        test_data = {
+            "sql_id": "q123",
+            "avg_time": 150,
+            "schema": "public",
+            "sample_sql": "SELECT * FROM users"
+        }
+        result = generate_refactor_script(test_data)
+        assert "q123" in result
+        assert "150ms" in result
+        assert "public" in result
+        assert "SELECT * FROM users" in result
+
+    def test_generate_refactor_script_missing_fields(self):
+        """Test refactor script with missing required fields"""
+        with pytest.raises(ValueError):
+            generate_refactor_script({"sql_id": "q123"})  # missing sample_sql
+
+    @patch("os.makedirs")
+    @patch("builtins.open", new_callable=mock_open)
+    def test_save_sql_script_success(self, mock_file, mock_makedirs):
+        """Test successful script saving"""
+        assert save_sql_script("TEST SCRIPT", "test") is True
+        mock_makedirs.assert_called_once()
+        mock_file.assert_called_once()
+
+    @patch("os.makedirs")
+    @patch("builtins.open", side_effect=IOError("Test error"))
+    def test_save_sql_script_failure(self, mock_file, mock_makedirs):
+        """Test script saving failure"""
+        assert save_sql_script("TEST SCRIPT", "test") is False
+
+    def test_save_sql_script_invalid_input(self):
+        """Test script saving with invalid input"""
+        with pytest.raises(ValueError):
+            save_sql_script("", "test")
+        with pytest.raises(ValueError):
+            save_sql_script("VALID", "")
+
+    def test_generate_scripts_empty(self):
+        """Test with empty solutions list"""
+        assert generate_scripts([]) == []
+
+    def test_generate_scripts_invalid_input(self):
+        """Test with invalid input type"""
+        with pytest.raises(ValueError):
+            generate_scripts("not a list")
+
+    @patch("functions.script_generator.save_sql_script", return_value=True)
+    def test_generate_scripts_t1(self, mock_save):
+        """Test T1 script generation"""
+        solutions = [{
+            "table": "users",
+            "category": "T1",
+            "priority_score": 5
+        }]
+        result = generate_scripts(solutions)
+        assert len(result) == 1
+        assert "T1_idx_users" in result[0]
+
+    @patch("functions.script_generator.save_sql_script", return_value=True)
+    def test_generate_scripts_t2(self, mock_save):
+        """Test T2 script generation"""
+        solutions = [{
+            "table": "orders",
+            "category": "T2",
+            "group_key": "q123",
+            "sample_sql": "SELECT * FROM orders",
+            "avg_exec_time": 200
+        }]
+        result = generate_scripts(solutions)
+        assert len(result) == 1
+        assert "T2_refactor_orders" in result[0]
+
+    def test_generate_scripts_invalid_item(self, caplog):
+        """Test with invalid solution item"""
+        result = generate_scripts(["not a dict"])
+        assert len(result) == 0
+        assert "Solução inválida" in caplog.text
+
+    def test_generate_scripts_unknown_category(self, caplog):
+        """Test with unknown category"""
+        result = generate_scripts([{
+            "table": "logs",
+            "category": "T3"
+        }])
+        assert len(result) == 0
+        assert "Categoria desconhecida" in caplog.text
+
+    @patch("functions.script_generator.generate_index_script", side_effect=Exception("Test error"))
+    def test_generate_scripts_handles_errors(self, mock_gen, caplog):
+        """Test error handling during generation"""
+        result = generate_scripts([{
+            "table": "users",
+            "category": "T1"
+        }])
+        assert len(result) == 0
+        assert "Erro ao gerar script" in caplog.text
+
+
+# Arquivo: performance_improvement.py
+
+## performance_improvement.py
+import logging
+from typing import List, Dict, Any, Optional
+from functions.db_utils import OracleTableReader
+
+logger = logging.getLogger(__name__)
+
+def evaluate_performance(db_reader: OracleTableReader, 
+                        tables: Dict[str, List[Dict[str, Any]]],
+                        queries: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """
+    Avalia impacto potencial de melhorias usando OracleTableReader.
+    
+    Args:
+        db_reader: Instância de OracleTableReader
+        tables: Dicionário com tabelas classificadas (T1 e T2)
+        queries: Lista opcional de queries para análise
+        
+    Returns:
+        Lista de dicionários com sugestões de melhoria
+    
+    Raises:
+        TypeError: Se os parâmetros forem de tipos inválidos
+    """
+    # Validação de entrada
+    if not isinstance(db_reader, OracleTableReader):
+        logger.error("❌ db_reader deve ser uma instância de OracleTableReader")
+        raise TypeError("db_reader deve ser uma instância de OracleTableReader")
+        
+    if not isinstance(tables, dict):
+        logger.error("❌ tables deve ser um dicionário")
+        raise TypeError("tables deve ser um dicionário")
+    
+    if not db_reader.is_connected():
+        logger.error("❌ Conexão com banco de dados não disponível.")
+        return []
+    
+    solutions = []
+    
+    try:
+        # Processar tabelas T1
+        for table_info in tables.get("T1", []):
+            if not isinstance(table_info, dict):
+                logger.warning(f"⚠️ Informações inválidas para tabela T1: {table_info}")
+                continue
+                
+            table_name = table_info.get("table")
+            if not table_name:
+                logger.warning("⚠️ Tabela T1 sem nome, ignorando")
+                continue
+                
+            indexes = db_reader.get_existing_indexes(table_name)
+            
+            solutions.append({
+                "table": table_name,
+                "size_mb": table_info.get("size_mb", 0),
+                "category": "T1",
+                "suggestion": "criar índice" if not indexes else "índice já existe",
+                "existing_indexes": indexes,
+                "priority_score": 8 if not indexes else 2,
+                "impact": "Alta" if not indexes else "Baixa"
+            })
+        
+        # Processar tabelas T2
+        for table_info in tables.get("T2", []):
+            if not isinstance(table_info, dict):
+                logger.warning(f"⚠️ Informações inválidas para tabela T2: {table_info}")
+                continue
+                
+            table_name = table_info.get("table")
+            if not table_name:
+                logger.warning("⚠️ Tabela T2 sem nome, ignorando")
+                continue
+                
+            size_mb = table_info.get("size_mb", 0)
+            indexes = db_reader.get_existing_indexes(table_name)
+            
+            relevant_queries = [
+                q for q in (queries or [])
+                if isinstance(q, dict) and table_name in q.get("tables", [])
+            ]
+            
+            gain = sum(
+                _estimate_gain(q, size_mb)["estimated_gain_percent"]
+                for q in relevant_queries
+            ) / len(relevant_queries) if relevant_queries else 0
+            
+            solutions.append({
+                "table": table_name,
+                "size_mb": size_mb,
+                "category": "T2",
+                "suggestion": "refatorar query ou particionar" if indexes else "considerar índice",
+                "queries_affected": [q.get("sql_id") for q in relevant_queries if q.get("sql_id")],
+                "avg_gain_percent": round(gain, 2),
+                "existing_indexes": indexes,
+                "priority_score": 9 if gain > 20 else (7 if gain > 0 else 5),
+                "impact": "Crítico" if gain > 20 else ("Médio" if gain > 0 else "Baixo")
+            })
+        
+        logger.info(f"💡 {len(solutions)} sugestões de melhoria geradas.")
+        return solutions
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao avaliar performance: {str(e)}")
+        raise RuntimeError(f"Erro ao avaliar performance: {str(e)}")
+
+def _estimate_gain(query: Dict[str, Any], table_size_mb: float) -> Dict[str, Any]:
+    """Estimativa de ganho de performance para uma query."""
+    if not isinstance(query, dict):
+        raise ValueError("Query deve ser um dicionário")
+        
+    if not isinstance(table_size_mb, (int, float)) or table_size_mb < 0:
+        raise ValueError("table_size_mb deve ser um número positivo")
+    
+    base_time = max(1, query.get("elapsed_time", 100))
+    gain_factor = 0.6 if table_size_mb < 10 else (0.4 if table_size_mb < 50 else 0.2)
+    
+    return {
+        "estimated_gain_percent": round(gain_factor * 100, 2),
+        "old_time": base_time,
+        "new_time": round(base_time * (1 - gain_factor), 2),
+        "schema": query.get("schema"),
+        "sql_id": query.get("sql_id")
+    }
+# Teste: test_performance_improvement.py
+
+# test_performance_improvement.py
+import pytest
+from unittest.mock import patch, MagicMock
+from functions.performance_improvement import (
+    evaluate_performance,
+    _estimate_gain
+)
+from functions.db_utils import OracleTableReader
+
+class TestPerformanceImprovement:
+    @pytest.fixture
+    def mock_reader(self):
+        mock = MagicMock(spec=OracleTableReader)
+        mock.is_connected.return_value = True
+        return mock
+
+    @pytest.fixture
+    def sample_tables(self):
+        return {
+            "T1": [{"table": "users", "size_mb": 5.0}],
+            "T2": [{"table": "orders", "size_mb": 15.0}]
+        }
+
+    @pytest.fixture
+    def sample_queries(self):
+        return [
+            {"sql_id": "q1", "tables": ["users"], "elapsed_time": 100},
+            {"sql_id": "q2", "tables": ["orders"], "elapsed_time": 200}
+        ]
+
+    def test_evaluate_performance_basic(self, mock_reader, sample_tables):
+        """Test basic performance evaluation"""
+        mock_reader.get_existing_indexes.return_value = []
+        solutions = evaluate_performance(mock_reader, sample_tables)
+        
+        assert len(solutions) == 2
+        assert solutions[0]["suggestion"] == "criar índice"
+        assert solutions[1]["suggestion"] == "considerar índice"
+
+    def test_evaluate_performance_with_queries(self, mock_reader, sample_tables, sample_queries):
+        """Test evaluation with query analysis"""
+        mock_reader.get_existing_indexes.return_value = ["existing_idx"]
+        solutions = evaluate_performance(mock_reader, sample_tables, sample_queries)
+        
+        assert len(solutions) == 2
+        assert solutions[1]["queries_affected"] == ["q2"]
+        assert isinstance(solutions[1]["avg_gain_percent"], float)
+
+    def test_evaluate_performance_no_connection(self, mock_reader, sample_tables):
+        """Test with no database connection"""
+        mock_reader.is_connected.return_value = False
+        solutions = evaluate_performance(mock_reader, sample_tables)
+        assert solutions == []
+
+    def test_evaluate_performance_invalid_input(self, mock_reader):
+        """Test with invalid input types"""
+        with pytest.raises(TypeError):
+            evaluate_performance(None, {})
+            
+        with pytest.raises(TypeError):
+            evaluate_performance(mock_reader, "not a dict")
+
+    def test_evaluate_performance_empty_tables(self, mock_reader):
+        """Test with empty tables dictionary"""
+        solutions = evaluate_performance(mock_reader, {})
+        assert solutions == []
+
+    def test_evaluate_performance_invalid_table_data(self, mock_reader, caplog):
+        """Test with invalid table data"""
+        solutions = evaluate_performance(mock_reader, {"T1": ["invalid"]})
+        assert len(solutions) == 0
+        assert "Informações inválidas" in caplog.text
+
+    def test_estimate_gain_basic(self):
+        """Test basic gain estimation"""
+        result = _estimate_gain({"elapsed_time": 100}, 8.0)
+        assert result["estimated_gain_percent"] > 0
+        assert result["new_time"] < 100
+
+    def test_estimate_gain_various_sizes(self):
+        """Test gain estimation with different table sizes"""
+        small = _estimate_gain({"elapsed_time": 100}, 5.0)
+        medium = _estimate_gain({"elapsed_time": 100}, 30.0)
+        large = _estimate_gain({"elapsed_time": 100}, 100.0)
+        
+        assert small["estimated_gain_percent"] > medium["estimated_gain_percent"]
+        assert medium["estimated_gain_percent"] > large["estimated_gain_percent"]
+
+    def test_estimate_gain_invalid_input(self):
+        """Test gain estimation with invalid input"""
+        with pytest.raises(ValueError):
+            _estimate_gain("not a dict", 10.0)
+            
+        with pytest.raises(ValueError):
+            _estimate_gain({}, -1.0)
+
+    @patch('functions.performance_improvement.logger')
+    def test_error_handling(self, mock_logger, mock_reader):
+        """Test error handling during evaluation"""
+        mock_reader.is_connected.side_effect = Exception("DB error")
+        with pytest.raises(RuntimeError):
+            evaluate_performance(mock_reader, {"T1": [{"table": "users"}]})
+        mock_logger.error.assert_called()
+
+

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FTS Report - {{ timestamp }}</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #333; }
+        .section { margin-bottom: 30px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+    </style>
+</head>
+<body>
+    <h1>FTS Report</h1>
+    <p>Generated at: {{ timestamp }}</p>
+
+    <div class="section">
+        <h2>Query Analysis</h2>
+        {% for category, queries in queries.items() %}
+            <h3>{{ category }} queries ({{ queries|length }})</h3>
+            <ul>
+                {% for query in queries %}
+                    <li><code>{{ query }}</code></li>
+                {% endfor %}
+            </ul>
+        {% endfor %}
+    </div>
+
+    <div class="section">
+        <h2>Schema Classification</h2>
+        {% for category, schemas in schemas.items() %}
+            <h3>{{ category }} schemas ({{ schemas|length }})</h3>
+            <ul>
+                {% for schema in schemas %}
+                    <li>{{ schema }}</li>
+                {% endfor %}
+            </ul>
+        {% endfor %}
+    </div>
+</body>

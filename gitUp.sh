@@ -14,4 +14,4 @@ git status
 git add .
 git commit -m "Atualização automática: $(date '+%Y-%m-%d %H:%M')"
 git push origin dev
-git remote -v   
+git remote -v 
